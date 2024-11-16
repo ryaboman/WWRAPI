@@ -4,39 +4,108 @@ using System.Net.Http;
 using System.IO;
 using Newtonsoft.Json;
 using System.Threading.Tasks;
+using System.Threading;
 using System.Runtime.Serialization.Formatters.Binary;
+using System.Collections.Generic;
+using System.Net.Http.Headers;
 
 namespace WWRAPI {
 
-    public class RAPI<ResponseDataType> {
+    public class RAPI {
 
-        public delegate void ChangeStateTask(RAPI<ResponseDataType> value);
+        private ISerializable serializer;
+
+        private bool busyFlag = false;
+        public bool requesting;
+
+        public delegate void ChangeStateTask(RAPI value);
 
         //Событие по завершению запроса
         public event ChangeStateTask RequestDone;
 
         public HttpStatusCode statusCode = HttpStatusCode.BadRequest;
 
-        public static CookieCollection cookies = null;
+        public CookieCollection cookies = null;
 
         private string pathToFileCookie;
 
         public string APP_PATH;
 
-        private HttpContent content = null;
+        private HttpClient client = null;
+        private HttpClientHandler handler = null;
 
-        public ResponseDataType responseData;
+        private string responseData;
 
-        public bool requesting;
 
-        public RAPI(string pathToFileCookie){
+
+        public RAPI(string pathToFileCookie) {
             this.pathToFileCookie = pathToFileCookie;
             ReadCookieFile();
+            OpenConnection(null);
+        }
+
+        public RAPI(string pathToFileCookie, Dictionary<string, string> headerOptions) {
+            this.pathToFileCookie = pathToFileCookie;
+            ReadCookieFile();
+            OpenConnection(headerOptions);
+        }
+
+        public string GetRawData() {
+            return responseData;
+        }
+
+        public void SetSerializer(ISerializable serializer) {
+            this.serializer = serializer;
+        }
+
+        public bool isBusy() {
+            return busyFlag;
+        }
+
+        public ResponseDataType GetDeserializeObject<ResponseDataType>() {
+            // Десериализация полученного JSON-объекта
+            ResponseDataType responseData;
+            serializer.Deserialize<ResponseDataType>(this.responseData, out responseData);
+            return responseData;
+        }
+
+        public void GetDeserializeObject<ResponseDataType>(out ResponseDataType responseData) {
+            // Десериализация полученного JSON-объекта
+            serializer.Deserialize<ResponseDataType>(this.responseData, out responseData);
+        }
+
+        private bool OpenConnection(Dictionary<string, string> headerOptions) {
+            handler = new HttpClientHandler();
+
+            handler.CookieContainer = new CookieContainer();
+
+            if (cookies != null) {
+                handler.CookieContainer.Add(cookies);
+            }
+
+            client = new HttpClient(handler);
+
+            if (headerOptions != null) {
+                foreach (var pairKeyValue in headerOptions) {
+                    if ((pairKeyValue.Key != "Content-Type") && (pairKeyValue.Key != "Content-Length")) {
+                        client.DefaultRequestHeaders.Add(pairKeyValue.Key, pairKeyValue.Value);
+                    }
+                }
+            }
+            
+
+            return true;
+        }
+
+        public void CloseConnection() {
+
+
         }
 
         //Функция авторизации пользователя на web ресурсе
         //И получения куков авторизации
-        public async void Authentication<RequestDataType>(string pathAPI, RequestDataType requestData) {
+        //Эту функцию нужно будет удалить. На metanit нужно почитать про то как какие функции сейчас лучше использовать.
+        public async void Authentication<RequestDataType>(string pathAPI, RequestDataType requestData, Dictionary<string, string> headerOptions) {
 
             cookies = null;
 
@@ -47,10 +116,14 @@ namespace WWRAPI {
                 request.CookieContainer = new CookieContainer();
                 request.AllowAutoRedirect = false;
 
-                string data = JsonConvert.SerializeObject(requestData);
+                string data = serializer.Serialize(requestData);
                 byte[] byteArray = System.Text.Encoding.UTF8.GetBytes(data);
                 // устанавливаем тип содержимого - параметр ContentType
                 request.ContentType = "application/x-www-form-urlencoded";
+                foreach(var pairKeyValue in headerOptions) {
+                    request.Headers.Add(pairKeyValue.Key, pairKeyValue.Value);
+                }
+                
                 // Устанавливаем заголовок Content-Length запроса - свойство ContentLength
                 request.ContentLength = byteArray.Length;
 
@@ -62,17 +135,15 @@ namespace WWRAPI {
 
                 //Получаем ответ
                 HttpWebResponse response = (HttpWebResponse)request.GetResponse();
-
+                
                 statusCode = response.StatusCode;
 
                 using (Stream stream = response.GetResponseStream()) {
 
                     using (StreamReader reader = new StreamReader(stream)) {
 
-                        //При авторизации нам не важет ответ echo от сервера
-                        string responseStr = reader.ReadToEnd();
-
-                        responseData = JsonConvert.DeserializeObject<ResponseDataType>(responseStr);
+                        //При авторизации нам не важен ответ echo от сервера
+                        responseData = reader.ReadToEnd();
 
                     }
 
@@ -93,48 +164,46 @@ namespace WWRAPI {
         }
 
         //Функция получения данных json с сервера
-        public async Task PostRequest<RequestDataType>(string pathAPI, RequestDataType requestData) {
+        public async Task PostRequest<RequestDataType>(string pathAPI, RequestDataType requestData, Dictionary<string, string> headerOptions = null) {
+
+            busyFlag = true;
 
             try {
                 string pathToAplicationAPI = APP_PATH + pathAPI;
 
-                using (var handler = new HttpClientHandler()) {
+                string json = serializer.Serialize(requestData);
+                HttpContent requestContent = new StringContent(json);
 
-                    handler.CookieContainer = new CookieContainer();
+                if (headerOptions != null) {
+                    foreach (var pairKeyValue in headerOptions) {
+                        if (pairKeyValue.Key == "Content-Type") {
+                            requestContent.Headers.ContentType = new MediaTypeHeaderValue(pairKeyValue.Value);
+                        }
+                        else if (pairKeyValue.Key == "Content-Length") {
 
-                    if (cookies != null) {
-                        handler.CookieContainer.Add(cookies);
+                        }
                     }
-
-
-                    using (var client = new HttpClient(handler)) {
-
-                        string json = JsonConvert.SerializeObject(requestData);
-                        HttpContent requestContent = new StringContent(json);
-
-                        //client.Timeout = TimeSpan.FromSeconds(2);
-
-                        HttpResponseMessage response = await client.PostAsync(pathToAplicationAPI, requestContent);
-
-                        statusCode = response.StatusCode;
-
-                        cookies = handler.CookieContainer
-                            .GetCookies(new Uri(pathToAplicationAPI));
-
-                        WriteCookieFile(cookies);
-
-                        string responseStr = response.Content.ReadAsStringAsync().Result;
-                        // Десериализация полученного JSON-объекта
-                        responseData = JsonConvert.DeserializeObject<ResponseDataType>(responseStr);
-                        
-                        //"{\"login\":\"user\",\"password\":\"123456\",\"statusAuthentication\":true,\"errorAuthentication\":[]}"
-                        
-                    }
-
-
                 }
 
+                //client.Timeout = TimeSpan.FromSeconds(2);
+
+                HttpResponseMessage response = await client.PostAsync(pathToAplicationAPI, requestContent);
+
+                var responseText = await response.Content.ReadAsStringAsync();
+                //Console.WriteLine(responseText);
+
+                statusCode = response.StatusCode;
+
                 
+
+                cookies = handler.CookieContainer
+                    .GetCookies(new Uri(pathToAplicationAPI));
+
+                WriteCookieFile(cookies);
+
+                responseData = response.Content.ReadAsStringAsync().Result;
+
+
             }
             catch (ArgumentOutOfRangeException ex) {
                 Console.WriteLine("Время запроса вышло 1!");
@@ -147,16 +216,19 @@ namespace WWRAPI {
 
                 Console.WriteLine();
             }
-            catch {
+            catch (Exception ex) {
                 Console.WriteLine("Что-то случилось!");
             }
+            finally {
+                RequestDone?.Invoke(this);
+            }
 
-            RequestDone?.Invoke(this);           
+            busyFlag = false;
         }
 
         //Функция получения данных json с сервера
-        //Переименовать в POST
-        public async Task GetRequest(string pathAPI) {
+        public async Task GetRequest(string pathAPI, Dictionary<string, string> headerOptions = null) {
+            busyFlag = true;
 
             try {
                 string pathToAplicationAPI = APP_PATH + pathAPI;
@@ -169,10 +241,22 @@ namespace WWRAPI {
                         handler.CookieContainer.Add(cookies);
                     }
 
+                    //handler.
 
                     using (var client = new HttpClient(handler)) {
 
-                        HttpResponseMessage response = await client.GetAsync(pathToAplicationAPI);
+                        var request = new HttpRequestMessage(HttpMethod.Get, pathToAplicationAPI);
+
+                        if (headerOptions != null) {
+                            foreach (var pairKeyValue in headerOptions) {
+                                if ((pairKeyValue.Key != "Content-Type") && (pairKeyValue.Key != "Content-Length")) {
+                                    client.DefaultRequestHeaders.Add(pairKeyValue.Key, pairKeyValue.Value);
+                                }
+                            }
+                        }
+
+                        HttpResponseMessage response = await client.SendAsync(request);
+
 
                         statusCode = response.StatusCode;
 
@@ -183,11 +267,7 @@ namespace WWRAPI {
 
                         string responseStr = response.Content.ReadAsStringAsync().Result;
 
-                        // Десериализация полученного JSON-объекта
-                        responseData = JsonConvert.DeserializeObject<ResponseDataType>(responseStr);
-
-                        //"{\"login\":\"user\",\"password\":\"123456\",\"statusAuthentication\":true,\"errorAuthentication\":[]}"
-
+                        responseData = await response.Content.ReadAsStringAsync();
                     }
 
 
@@ -211,10 +291,14 @@ namespace WWRAPI {
             }
 
             RequestDone?.Invoke(this);
+
+            busyFlag = false;
         }
 
         //Функция скачивания файла с сервера
         public async Task<string> GetFileFromServerToAsync(string pathAPI, string pathToWrite) {
+
+            busyFlag = true;
 
             string pathSave = String.Empty;
 
@@ -277,6 +361,8 @@ namespace WWRAPI {
 
             RequestDone?.Invoke(this);
 
+            busyFlag = false;
+
             return pathSave;
 
 
@@ -284,6 +370,9 @@ namespace WWRAPI {
 
         //Функция загрузки файла на сервер
         public async Task<string> SendFileToServerToAsync(string pathAPI, string pathToFile) {
+
+            busyFlag = true;
+
             string responseStr = String.Empty;
 
             try {
@@ -333,7 +422,9 @@ namespace WWRAPI {
             }
 
             RequestDone?.Invoke(this);
-            
+
+            busyFlag = false;
+
             return responseStr;
         }
 
